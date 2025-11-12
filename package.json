@@ -1,0 +1,33 @@
+{
+  "name": "postgres-n-plus-one-join",
+  "version": "1.0.0",
+  "description": "N+1 Problem and JOIN demonstration with PostgreSQL",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node-dev --respawn --transpile-only src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "db:test": "ts-node src/scripts/test-connection.ts",
+    "db:setup": "ts-node src/scripts/setup.ts",
+    "db:seed-large": "ts-node src/scripts/seed-large.ts",
+    "test:n-plus-one": "ts-node src/tests/n-plus-one-test.ts",
+    "test:join": "ts-node src/tests/join-test.ts",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "dotenv": "^16.3.1",
+    "express": "^5.1.0",
+    "pg": "^8.11.3"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.5",
+    "@types/node": "^20.10.0",
+    "@types/pg": "^8.10.9",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.55.0",
+    "ts-node": "^10.9.1",
+    "ts-node-dev": "^2.0.0",
+    "typescript": "^5.3.2"
+  }
+}

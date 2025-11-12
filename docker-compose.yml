@@ -1,0 +1,43 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16
+    container_name: postgres_n_plus_one
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: n_plus_one_dev
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./sql_scripts:/sql_scripts
+    command:
+      - "postgres"
+      - "-c"
+      - "log_statement=all"
+      - "-c"
+      - "log_duration=on"
+      - "-c"
+      - "log_min_duration_statement=0"
+      - "-c"
+      - "log_line_prefix=%t [%p]: "
+
+  # app:
+  #   build: .
+  #   container_name: node_n_plus_one
+  #   environment:
+  #     DATABASE_URL: postgresql://postgres:password@db:5433/n_plus_one_dev
+  #     NODE_ENV: development
+  #   depends_on:
+  #     - db
+  #   volumes:
+  #     - .:/app
+  #     - /app/node_modules
+  #   ports:
+  #     - "3000:3000"
+  #   command: npm run dev
+
+volumes:
+  postgres_data:
