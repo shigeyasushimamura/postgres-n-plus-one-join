@@ -674,6 +674,677 @@ async function goodExample(userId: number) {
 
 ---
 
+---
+
+## 🔒 中級編：トランザクション分離レベル詳細
+
+### 分離レベルとは？
+
+複数のトランザクションが同時に実行されたとき、**どの程度お互いを隔離するか**を決める設定です。
+
+| 分離レベル       | 説明                       | パフォーマンス | 安全性                           |
+| ---------------- | -------------------------- | -------------- | -------------------------------- |
+| READ UNCOMMITTED | コミット前のデータも読める | ⚡⚡⚡⚡ 最速  | ⚠️ 最低（PostgreSQL 未サポート） |
+| READ COMMITTED   | コミット済みデータのみ読む | ⚡⚡⚡ 速い    | 🔒 中程度（デフォルト）          |
+| REPEATABLE READ  | 同じデータは常に同じ値     | ⚡⚡ やや遅い  | 🔒🔒 高い                        |
+| SERIALIZABLE     | 完全な直列化（順番に実行） | ⚡ 遅い        | 🔒🔒🔒 最高                      |
+
+---
+
+### 実務でよくある問題と対策
+
+#### 問題 1: ダーティリード（Dirty Read）
+
+**コミットされていないデータを読んでしまう**
+
+```typescript
+// ❌ READ UNCOMMITTED（PostgreSQLは未サポート）
+// トランザクションA
+await client.query("BEGIN");
+await client.query("UPDATE products SET price = 1000 WHERE id = 1");
+// まだCOMMITしていない
+
+// トランザクションB
+// price = 1000 を読んでしまう（Aがロールバックするかもしれないのに！）
+```
+
+**PostgreSQL では READ COMMITTED がデフォルトなので、この問題は起きません。**
+
+---
+
+#### 問題 2: ノンリピータブルリード（Non-Repeatable Read）
+
+**同じトランザクション内で、同じデータを 2 回読んだら値が変わっている**
+
+```typescript
+// READ COMMITTED（デフォルト）での問題例
+async function priceCheck() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL READ COMMITTED");
+
+    // 1回目: 価格を確認
+    const result1 = await client.query(
+      "SELECT price FROM products WHERE id = $1",
+      [1]
+    );
+    console.log("1回目の価格:", result1.rows[0].price); // 1000円
+
+    // この間に、別のトランザクションが価格を2000円に変更してCOMMIT
+
+    // 2回目: 同じ商品の価格を確認
+    const result2 = await client.query(
+      "SELECT price FROM products WHERE id = $1",
+      [1]
+    );
+    console.log("2回目の価格:", result2.rows[0].price); // 2000円（変わってる！）
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// ✅ REPEATABLE READで解決
+async function priceCheckFixed() {
+  const client = await pool.connect();
+  try {
+    // REPEATABLE READを指定
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+
+    const result1 = await client.query(
+      "SELECT price FROM products WHERE id = $1",
+      [1]
+    );
+    console.log("1回目の価格:", result1.rows[0].price); // 1000円
+
+    // 別のトランザクションが価格を変更しても...
+
+    const result2 = await client.query(
+      "SELECT price FROM products WHERE id = $1",
+      [1]
+    );
+    console.log("2回目の価格:", result2.rows[0].price); // 1000円（変わらない！）
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+```
+
+**いつ使う？**
+
+- レポート生成（途中でデータが変わると困る）
+- 複数回の SELECT で一貫したデータが必要な場合
+
+---
+
+#### 問題 3: ファントムリード（Phantom Read）
+
+**同じ条件で検索したら、行の数が変わっている**
+
+```typescript
+// REPEATABLE READでも起きる可能性がある問題
+async function countOrders() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+
+    // 1回目: 未発送の注文数をカウント
+    const result1 = await client.query(
+      "SELECT COUNT(*) FROM orders WHERE status = $1",
+      ["pending"]
+    );
+    console.log("1回目の件数:", result1.rows[0].count); // 10件
+
+    // この間に、別のトランザクションが新しい注文をINSERT
+
+    // 2回目: 同じ条件でカウント
+    const result2 = await client.query(
+      "SELECT COUNT(*) FROM orders WHERE status = $1",
+      ["pending"]
+    );
+    console.log("2回目の件数:", result2.rows[0].count); // 11件（増えてる！）
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// ✅ PostgreSQLのREPEATABLE READは実はファントムリードも防ぐ
+// MySQLのInnoDBも同様（MVCC + ネクストキーロック）
+```
+
+**PostgreSQL と MySQL の特徴**:
+
+- PostgreSQL: REPEATABLE READ でもファントムリードを防ぐ（MVCC）
+- MySQL (InnoDB): REPEATABLE READ がデフォルトで、ファントムリードも防ぐ
+
+---
+
+### 実務での分離レベルの選び方
+
+```typescript
+// パターン1: 通常のCRUD操作（デフォルトでOK）
+async function normalOperation() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN"); // READ COMMITTEDが使われる
+    await client.query("INSERT INTO posts ...");
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// パターン2: 集計レポート（データの一貫性が必要）
+async function generateReport() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL REPEATABLE READ");
+
+    const sales = await client.query(
+      "SELECT SUM(amount) FROM orders WHERE ..."
+    );
+    const products = await client.query(
+      "SELECT COUNT(*) FROM products WHERE ..."
+    );
+    // 途中でデータが変わらないことを保証
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// パターン3: 重要な金融取引（完全な直列化）
+async function transferMoney(from: number, to: number, amount: number) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN ISOLATION LEVEL SERIALIZABLE");
+
+    // 完全に他のトランザクションと隔離される
+    await client.query(
+      "UPDATE accounts SET balance = balance - $1 WHERE id = $2",
+      [amount, from]
+    );
+    await client.query(
+      "UPDATE accounts SET balance = balance + $1 WHERE id = $2",
+      [amount, to]
+    );
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+```
+
+---
+
+## 💀 デッドロック対策
+
+### デッドロックとは？
+
+2 つ以上のトランザクションが、**お互いのロックを待ち合ってしまい、永遠に進まない状態**
+
+```typescript
+// デッドロックの例
+// トランザクションA
+await client.query("BEGIN");
+await client.query("UPDATE products SET stock = stock - 1 WHERE id = 1"); // 商品1をロック
+// 商品2をロックしようとする
+await client.query("UPDATE products SET stock = stock - 1 WHERE id = 2");
+
+// トランザクションB（同時に実行）
+await client.query("BEGIN");
+await client.query("UPDATE products SET stock = stock - 1 WHERE id = 2"); // 商品2をロック
+// 商品1をロックしようとする（Aが持っている！待機...）
+await client.query("UPDATE products SET stock = stock - 1 WHERE id = 1");
+
+// → お互いが相手のロックを待って、永遠に進まない = デッドロック！
+```
+
+---
+
+### 対策 1: ロックの順序を統一する
+
+```typescript
+// ❌ 悪い例: ランダムな順序でロック
+async function badOrder(productIds: number[]) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    for (const id of productIds) {
+      await client.query(
+        "UPDATE products SET stock = stock - 1 WHERE id = $1",
+        [id]
+      );
+    }
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// ✅ 良い例: 常に同じ順序でロック
+async function goodOrder(productIds: number[]) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // IDでソートして、常に同じ順序でロック
+    const sortedIds = [...productIds].sort((a, b) => a - b);
+
+    for (const id of sortedIds) {
+      await client.query(
+        "UPDATE products SET stock = stock - 1 WHERE id = $1",
+        [id]
+      );
+    }
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+```
+
+---
+
+### 対策 2: デッドロック検出とリトライ
+
+```typescript
+// デッドロックエラーコード: 40P01（PostgreSQL）
+async function withDeadlockRetry<T>(
+  operation: () => Promise<T>,
+  maxRetries: number = 3
+): Promise<T> {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await operation();
+    } catch (error: any) {
+      // デッドロック検出
+      if (error.code === "40P01" && attempt < maxRetries) {
+        console.log(`デッドロック検出。リトライ ${attempt}/${maxRetries}`);
+
+        // 指数バックオフ（exponential backoff）
+        const waitTime = 100 * Math.pow(2, attempt - 1); // 100ms, 200ms, 400ms...
+        await new Promise((resolve) => setTimeout(resolve, waitTime));
+
+        continue; // リトライ
+      }
+
+      // デッドロック以外のエラー、またはリトライ上限
+      throw error;
+    }
+  }
+
+  throw new Error("デッドロックのリトライ上限に達しました");
+}
+
+// 使用例
+async function purchaseProducts(productIds: number[]) {
+  return withDeadlockRetry(async () => {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const sortedIds = [...productIds].sort((a, b) => a - b);
+
+      for (const id of sortedIds) {
+        await client.query(
+          "UPDATE products SET stock = stock - 1 WHERE id = $1",
+          [id]
+        );
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK");
+      throw error;
+    } finally {
+      client.release();
+    }
+  });
+}
+```
+
+---
+
+### 対策 3: タイムアウトの設定
+
+```typescript
+async function withTimeout() {
+  const client = await pool.connect();
+  try {
+    // ロック取得のタイムアウトを5秒に設定
+    await client.query("SET lock_timeout = 5000"); // ミリ秒
+
+    await client.query("BEGIN");
+
+    // 5秒以内にロックが取得できなければエラー
+    await client.query("UPDATE products SET stock = stock - 1 WHERE id = $1", [
+      1,
+    ]);
+
+    await client.query("COMMIT");
+  } catch (error: any) {
+    if (error.code === "55P03") {
+      // lock_timeout
+      console.log("ロック取得タイムアウト");
+    }
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+```
+
+---
+
+## 🔐 楽観的ロック vs 悲観的ロック
+
+### 悲観的ロック（Pessimistic Locking）
+
+**「誰かが同時に更新するだろう」と考え、先にロックする**
+
+```typescript
+async function pessimisticLock(productId: number, quantity: number) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // FOR UPDATE で行をロック（他のトランザクションは待たされる）
+    const product = await client.query(
+      "SELECT stock FROM products WHERE id = $1 FOR UPDATE",
+      [productId]
+    );
+
+    if (product.rows[0].stock < quantity) {
+      throw new Error("在庫不足");
+    }
+
+    await client.query("UPDATE products SET stock = stock - $1 WHERE id = $2", [
+      quantity,
+      productId,
+    ]);
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+```
+
+**メリット**:
+
+- データの整合性が確実
+- 競合が多い場合に有効
+
+**デメリット**:
+
+- ロック待ちで性能が下がる
+- デッドロックのリスク
+
+---
+
+### 楽観的ロック（Optimistic Locking）
+
+**「たぶん競合しないだろう」と考え、ロックせずに更新。更新時にバージョンチェック**
+
+```typescript
+// テーブルにversionカラムを追加
+// CREATE TABLE products (
+//   id SERIAL PRIMARY KEY,
+//   name TEXT,
+//   stock INT,
+//   version INT DEFAULT 0  -- バージョン管理用
+// );
+
+async function optimisticLock(productId: number, quantity: number) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // ロックせずにデータを読む
+    const product = await client.query(
+      "SELECT stock, version FROM products WHERE id = $1",
+      [productId]
+    );
+
+    const currentVersion = product.rows[0].version;
+
+    if (product.rows[0].stock < quantity) {
+      throw new Error("在庫不足");
+    }
+
+    // バージョンが変わっていないことを確認しながら更新
+    const result = await client.query(
+      `UPDATE products 
+       SET stock = stock - $1, version = version + 1 
+       WHERE id = $2 AND version = $3`,
+      [quantity, productId, currentVersion]
+    );
+
+    if (result.rowCount === 0) {
+      // 他の誰かが先に更新した！
+      throw new Error(
+        "データが他のユーザーによって更新されました。再試行してください。"
+      );
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+// リトライ付き楽観的ロック
+async function optimisticLockWithRetry(productId: number, quantity: number) {
+  return withDeadlockRetry(async () => {
+    await optimisticLock(productId, quantity);
+  });
+}
+```
+
+**メリット**:
+
+- ロック待ちがない（高速）
+- デッドロックが起きにくい
+
+**デメリット**:
+
+- 競合時にリトライが必要
+- 競合が多いと非効率
+
+---
+
+### どちらを使う？
+
+| シチュエーション     | 推奨         | 理由                             |
+| -------------------- | ------------ | -------------------------------- |
+| 在庫管理（競合多い） | 悲観的ロック | 確実に在庫を確保したい           |
+| いいね機能           | 楽観的ロック | 競合は少ない、失敗しても問題ない |
+| チケット予約         | 悲観的ロック | 二重予約は絶対に避けたい         |
+| プロフィール編集     | 楽観的ロック | 同時編集はまれ                   |
+| 銀行取引             | 悲観的ロック | データ整合性が最優先             |
+
+---
+
+## ⚡ トランザクションのパフォーマンス最適化
+
+### 1. トランザクションを短く保つ
+
+```typescript
+// ❌ 悪い例: トランザクションが長すぎる
+async function badTransaction(userId: number) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 外部API呼び出し（3秒かかる）
+    const userData = await fetch("https://api.example.com/user/" + userId);
+    const data = await userData.json();
+
+    // 画像処理（5秒かかる）
+    const processedImage = await processImage(data.avatar);
+
+    // ここまで8秒もトランザクションが開いている！
+    // その間、ロックされたデータに誰もアクセスできない
+
+    await client.query("INSERT INTO users ...", [data]);
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// ✅ 良い例: トランザクションは最小限に
+async function goodTransaction(userId: number) {
+  // トランザクション外で時間のかかる処理を実行
+  const userData = await fetch("https://api.example.com/user/" + userId);
+  const data = await userData.json();
+  const processedImage = await processImage(data.avatar);
+
+  // データベース操作だけトランザクション内で
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query("INSERT INTO users ...", [data]);
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+```
+
+---
+
+### 2. 不要なロックを避ける
+
+```typescript
+// ❌ 悪い例: 読み取り専用なのにFOR UPDATEを使う
+async function badSelect() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 読むだけなのにロックしてしまう
+    const posts = await client.query("SELECT * FROM posts FOR UPDATE");
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// ✅ 良い例: 更新しないならロック不要
+async function goodSelect() {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 読み取り専用ならロック不要
+    const posts = await client.query("SELECT * FROM posts");
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+```
+
+---
+
+### 3. バッチ処理での工夫
+
+```typescript
+// ❌ 悪い例: 1件ずつトランザクション
+async function badBatch(users: User[]) {
+  for (const user of users) {
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query("INSERT INTO users ...", [user]);
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+  }
+  // トランザクションの開始/終了のオーバーヘッドが大きい
+}
+
+// ✅ 良い例: まとめてトランザクション
+async function goodBatch(users: User[]) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // バルクインサート
+    const values = users
+      .map((user, i) => `($${i * 3 + 1}, $${i * 3 + 2}, $${i * 3 + 3})`)
+      .join(",");
+
+    const params = users.flatMap((u) => [u.name, u.email, u.age]);
+
+    await client.query(
+      `INSERT INTO users (name, email, age) VALUES ${values}`,
+      params
+    );
+
+    await client.query("COMMIT");
+  } finally {
+    client.release();
+  }
+}
+
+// さらに良い例: 大量データは分割してコミット
+async function betterBatch(users: User[]) {
+  const BATCH_SIZE = 1000;
+
+  for (let i = 0; i < users.length; i += BATCH_SIZE) {
+    const batch = users.slice(i, i + BATCH_SIZE);
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      // 1000件ずつ処理
+      const values = batch
+        .map(
+          (user, idx) => `($${idx * 3 + 1}, $${idx * 3 + 2}, $${idx * 3 + 3})`
+        )
+        .join(",");
+
+      const params = batch.flatMap((u) => [u.name, u.email, u.age]);
+
+      await client.query(
+        `INSERT INTO users (name, email, age) VALUES ${values}`,
+        params
+      );
+
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+  }
+}
+```
+
+---
+
 ## 🚀 まとめ
 
 ### ACID 特性の覚え方
@@ -687,7 +1358,37 @@ async function goodExample(userId: number) {
 
 ---
 
-### トランザクション実装のチェックリスト
+### 分離レベルの選び方（クイックリファレンス）
+
+| 用途         | 推奨分離レベル               | 理由                 |
+| ------------ | ---------------------------- | -------------------- |
+| 通常の CRUD  | READ COMMITTED（デフォルト） | バランスが良い       |
+| 集計レポート | REPEATABLE READ              | データの一貫性が必要 |
+| 金融取引     | SERIALIZABLE                 | 完全な隔離が必要     |
+
+---
+
+### デッドロック対策チェックリスト
+
+- [ ] ロックの順序を統一（ID でソート）
+- [ ] デッドロック検出とリトライを実装
+- [ ] タイムアウトを設定
+- [ ] トランザクションを短く保つ
+- [ ] 楽観的ロック vs 悲観的ロックを適切に選択
+
+---
+
+### パフォーマンス最適化チェックリスト
+
+- [ ] 外部 API 呼び出しはトランザクション外で
+- [ ] 不要なロック（FOR UPDATE）を避ける
+- [ ] バッチ処理は適切なサイズで分割
+- [ ] 長時間トランザクションを避ける
+- [ ] インデックスを適切に設定
+
+---
+
+### トランザクション実装のチェックリスト（基本編）
 
 - [ ] `BEGIN` でトランザクション開始
 - [ ] 成功時は `COMMIT` で確定
@@ -699,13 +1400,25 @@ async function goodExample(userId: number) {
 
 ---
 
-### 次のステップ
+### 実務レベル到達度チェック
 
-1. **実際に試す**: 投稿削除処理を実装してみる
-2. **エラーを起こす**: わざとエラーを発生させてロールバックを確認
-3. **ログを見る**: PostgreSQL のログで BEGIN/COMMIT/ROLLBACK を確認
-4. **複雑な処理**: 注文処理などの複数テーブルを扱う処理に挑戦
+| レベル   | できること                                         | このドキュメントのカバー度 |
+| -------- | -------------------------------------------------- | -------------------------- |
+| **初級** | 基本的な CRUD 操作                                 | ✅ 完全カバー              |
+| **中級** | 分離レベル、デッドロック対策、パフォーマンス最適化 | ✅ 完全カバー              |
+| **上級** | 分散トランザクション、2 フェーズコミット           | 📚 別途学習推奨            |
 
 ---
 
-トランザクションは**データの整合性を守る最後の砦**です。正しく使いこなして、安全なアプリケーションを作りましょう！ 🎯
+### 次のステップ
+
+1. **実際に試す**: 投稿削除処理を実装してみる
+2. **エラーを起こす**: わざとデッドロックを発生させて対処を確認
+3. **ログを見る**: PostgreSQL のログで BEGIN/COMMIT/ROLLBACK を確認
+4. **分離レベルを変更**: REPEATABLE READ で動作を比較
+5. **楽観的ロックを実装**: version カラムを使った実装に挑戦
+6. **パフォーマンス測定**: トランザクションの長さと性能の関係を確認
+
+---
+
+トランザクションは**データの整合性を守る最後の砦**です。基本から中級レベルまでを理解して、安全で高速なアプリケーションを作りましょう！ 🎯
